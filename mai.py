@@ -1,12 +1,12 @@
 """Helper functions for chat bot"""
 
-import enum
 import os
 from typing import List
 
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, T5ForConditionalGeneration
-from diffusers import StableDiffusionPipeline
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+model_id = 'codellama/CodeLlama-7b-Instruct-hf'
 
 USER_ENDOF_INPUT = "[/INST]"
 USER_ENDOF_INPUT_LEN = len(USER_ENDOF_INPUT)
@@ -14,52 +14,27 @@ USER_ENDOF_INPUT_LEN = len(USER_ENDOF_INPUT)
 HUGGINGFACE_API_KEY = os.getenv('HUGGINGFACE_API_KEY')
 assert HUGGINGFACE_API_KEY is not None
 
-class AiResponse(enum.Enum):
-    TEXT = 0
-    IMAGE = 1
-
 class Ai():
-    MAX_NEW_TOKENS=1024
-
-    def __init__(self, mission_prompt:str=None, tokenizer:AutoTokenizer=None, model:AutoModelForCausalLM=None, config:AutoConfig=None, chat_history = []) -> None:
+    def __init__(self, mission_prompt:str, tokenizer:AutoTokenizer, model:AutoModelForCausalLM, config:AutoConfig=None, auto_encode=False, chat_history = []) -> None:
         self.mission = mission_prompt
-        self.chat_history = chat_history
+        if auto_encode:
+            self.chat_history_templated = [
+                {
+                    'role': 'system',
+                    'content': mission_prompt
+                }
+            ]
+            self.func_encode = self.encode_tokenized
+        else:
+            self.chat_history_templated = []
+            self.chat_history = chat_history
+            self.func_encode = self.get_prompt
+
         self._tokenizer = tokenizer
         self._model = model
         self._config = config
         
-
-    def decode_tokenized(self, tokenized_outputs):
-        decoded_output = self._tokenizer.decode(tokenized_outputs[0])
-        returned_message = decoded_output[decoded_output.rfind(USER_ENDOF_INPUT)+USER_ENDOF_INPUT_LEN:-4]
-        return returned_message
-
-    def tell(self, message:str, **kwargs):
-        raise NotImplementedError
-
-
-class Mai(Ai):
-    MODEL_CODELLAMA = 'codellama/CodeLlama-7b-Instruct-hf'
-    mission_prompt = """You are a friendly and helpful assistant programmer. Your name is Mai.
-You are passionate about programming and always in a good mood.
-Ensure code block snippets do not exceed 800 characters in length. 
-If snippets are larger, split code into smaller blocks using backticks as you usually do."""
-
-    def __init__(self) -> None:
-        config = AutoConfig.from_pretrained(Mai.MODEL_CODELLAMA, load_in_4bit=True)
-        config.pretraining_tp = 1
-        model = AutoModelForCausalLM.from_pretrained(
-            Mai.MODEL_CODELLAMA,
-            config=config,
-            torch_dtype=torch.float16,
-            load_in_4bit=True,
-            device_map='auto',
-            use_safetensors=False,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(Mai.MODEL_CODELLAMA, token=HUGGINGFACE_API_KEY)
-        super().__init__(Mai.mission_prompt, tokenizer, model, config)
-
-    def encode(self, message) -> List[int]:
+    def get_prompt(self, message) -> str:
         texts = [f'<s>[INST] <<SYS>>\n{self.mission}\n<</SYS>>\n\n']
         # The first user input is _not_ stripped
         do_strip = False
@@ -69,33 +44,73 @@ If snippets are larger, split code into smaller blocks using backticks as you us
             texts.append(f'{user_input} [/INST] {response.strip()} </s><s>[INST] ')
         message = message.strip() if do_strip else message
         texts.append(f'{message} [/INST]')
-        tokenized = self._tokenizer([''.join(texts)], return_tensors='pt', add_special_tokens=False).to('cuda')
-        return tokenized
+        return ''.join(texts)
 
-    def tell(self,
-            message:str,
+    def decode_tokenized(self, tokenized_outputs):
+        decoded_output = self._tokenizer.decode(tokenized_outputs[0])
+        returned_message = decoded_output[decoded_output.rfind(USER_ENDOF_INPUT)+USER_ENDOF_INPUT_LEN:-4]
+        return returned_message
+
+    def encode_tokenized(self, message: str) -> (str | List[int]):
+        new_chat_history = self.chat_history + [{
+            'role': 'user',
+            'content': message
+        }]
+        return self._tokenizer.apply_chat_template(new_chat_history, return_tensors="pt")
+
+    def tell(self, 
+            message: str,
+            max_new_tokens: int = 1024,
             temperature: float = 0.1,
             top_p: float = 0.9,
-            top_k: int = 50,
-            **kwargs) -> str:
+            top_k: int = 50) -> str:
         
-        prompt = self.encode(message)
+        tokenized_query = self.func_encode(message)
         generate_kwargs = dict(
-            prompt,
-            max_new_tokens=self.MAX_NEW_TOKENS,
+            tokenized_query,
+            max_new_tokens=max_new_tokens,
             do_sample=True,
             top_p=top_p,
             top_k=top_k,
             temperature=temperature,
             num_beams=1,
+            pad_token_id=self._tokenizer.eos_token_id
         )
         
-        response = self._model.generate(**generate_kwargs)
-        answer = self.decode_tokenized(response)
-        self.chat_history.append(
-            (message, answer)
+        tokenized_response = self._model.generate(**generate_kwargs)
+        response = self.decode_tokenized(tokenized_response)
+        self.chat_history += [{
+            'role': 'user',
+            'content': message
+        },{
+            'role': 'assistant',
+            'content': response
+        }]
+        return response
+
+
+class Cody(Ai):
+    MODEL_CODELLAMA = 'codellama/CodeLlama-7b-Instruct-hf'
+    mission_prompt = """You are a friendly and helpful assistant programmer. Your name is Cody.
+You are passionate about programming and always in a good mood.
+Ensure code block snippets do not exceed 800 characters in length. 
+If snippets are larger, split code into smaller blocks using backticks as you usually do."""
+
+
+    def __init__(self) -> None:
+        config = AutoConfig.from_pretrained(Cody.MODEL_CODELLAMA, load_in_4bit=True)
+        config.pretraining_tp = 1
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            config=config,
+            torch_dtype='auto',#torch.float16,
+            device_map='auto',
+            use_safetensors=False,
+            offload_folder="offload"
+#            load_in_8bit=True,
         )
-        return answer
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=HUGGINGFACE_API_KEY)
+        super().__init__(Cody.mission_prompt, tokenizer, model, config)
 
 class Mistral(Ai):
     MODEL_MISTRAL = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -103,48 +118,17 @@ class Mistral(Ai):
 
     def __init__(self) -> None:
         tokenizer = AutoTokenizer.from_pretrained(Mistral.MODEL_MISTRAL, token=HUGGINGFACE_API_KEY)
-        model = AutoModelForCausalLM.from_pretrained(Mistral.MODEL_MISTRAL, torch_dtype="auto").to("cuda")
-        super().__init__(Mistral.mission_prompt, tokenizer, model)
+        model = AutoModelForCausalLM.from_pretrained(Mistral.MODEL_MISTRAL, torch_dtype="auto", device_map='auto')
 
-    def tell(self, message:str, **kwargs):
-        chat_template_msg = {'role': 'user', 'content': message }
-        self.chat_history.append(chat_template_msg)
+        super().__init__(Mistral.mission_prompt, tokenizer, model, auto_encode=False)
 
-        tokenized_chat = self._tokenizer.apply_chat_template(self.chat_history, return_tensors="pt").to("cuda")
-
-        outputs = self._model.generate(tokenized_chat, max_new_tokens=Ai.MAX_NEW_TOKENS, pad_token_id=self._tokenizer.eos_token_id)
-        answer = self.decode_tokenized(outputs)
-        chat_template_answer = {'role': 'assistant', 'content': answer }
-        self.chat_history.append(chat_template_answer)
-        return answer
-
-class Flan(Ai):
-    MODEL_FLAN = "google/flan-t5-base"
-
-    def __init__(self) -> None:
-        tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-        model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base", device_map="auto")
-
-        super().__init__("", tokenizer, model)
-            
-    def tell(self, message:str, **kwargs):
-        input_ids = self._tokenizer(message, return_tensors="pt").input_ids.to("cuda")
-
-        outputs = self._model.generate(input_ids, max_new_tokens=Ai.MAX_NEW_TOKENS)
-        return self.decode_tokenized(outputs)
-
-class Diva(Ai):
-    MODEL_STABLE_DIFFUSION = "runwayml/stable-diffusion-v1-5"
-
-    def __init__(self) -> None:
-        self.pipe = StableDiffusionPipeline.from_pretrained(Diva.MODEL_STABLE_DIFFUSION, torch_dtype=torch.float16).to("cuda")
-        super().__init__()
+    def tell(self, 
+            message: str,
+            max_new_tokens: int = 1024,
+            temperature: float = 0.1,
+            top_p: float = 0.9,
+            top_k: int = 50) -> str:
         
-    def tell(self, message:str, **kwargs):
-        image = self.pipe(message).images[0]
-        image.save("temp.png")
-        return 
-
 
 # class Mai():
 #     SYS_PROMPT = """You are a friendly and helpful assistant programmer. Your name is Mai.
